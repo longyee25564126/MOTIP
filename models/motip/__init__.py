@@ -8,7 +8,7 @@ from models.motip.id_decoder import IDDecoder
 
 
 def build(config: dict):
-    # Generate DETR args:
+    # 準備 DETR 所需的參數（轉成 Args）通通填入 detr_args 這個設定物件中。這些參數會用於 DETR backbone、transformer 結構、損失函數等:
     detr_args = Args()
     # 1. backbone:
     detr_args.backbone = config["BACKBONE"]
@@ -41,6 +41,7 @@ def build(config: dict):
     detr_args.set_cost_giou = config["DETR_SET_COST_GIOU"]
 
     detr_framework = config["DETR_FRAMEWORK"].lower()
+    #根據 DETR_FRAMEWORK 選擇哪個 DETR 模型，根據你在 config 中指定的 DETR 架構（例如 "deformable_detr"）來呼叫對應的 build_deformable_detr()
     match detr_framework:
         case "deformable_detr":
             detr, detr_criterion, _ = build_deformable_detr(args=detr_args)
@@ -48,13 +49,13 @@ def build(config: dict):
             raise NotImplementedError(f"DETR framework {config['DETR_FRAMEWORK']} is not supported.")
 
     # Build each component:
-    # 1. trajectory modeling (currently, only FFNs are used):
+    # 1. 建立軌跡建模模組（trajectory_modeling），如果不是只訓練 DETR，會建立這個模組，常見是用 FFN（前饋網路）來對時序特徵做聚合:
     _trajectory_modeling = TrajectoryModeling(
         detr_dim=config["DETR_HIDDEN_DIM"],
         ffn_dim_ratio=config["FFN_DIM_RATIO"],
         feature_dim=config["FEATURE_DIM"],
     ) if config["ONLY_DETR"] is False else None
-    # 2. ID decoder:
+    # 2. 建立 ID 解碼器（id_decoder）:
     _id_decoder = IDDecoder(
         feature_dim=config["FEATURE_DIM"],
         id_dim=config["ID_DIM"],
@@ -67,7 +68,7 @@ def build(config: dict):
         use_shared_aux_head=config["USE_SHARED_AUX_HEAD"],
     ) if config["ONLY_DETR"] is False else None
 
-    # Construct MOTIP model:
+    # 組裝 MOTIP 模型:
     motip_model = MOTIP(
         detr=detr,
         detr_framework=detr_framework,
@@ -75,5 +76,5 @@ def build(config: dict):
         trajectory_modeling=_trajectory_modeling,
         id_decoder=_id_decoder,
     )
-
+    # 回傳模型與損失函數
     return motip_model, detr_criterion

@@ -1,12 +1,17 @@
 # Copyright (c) Ruopeng Gao. All Rights Reserved.
 import argparse
 
-
+# 產生一個 命令列參數解析器（argparse.ArgumentParser）
 def runtime_option():
     """
-    Build a parser that can set up runtime options, such as choose device, data path, and so on.
-    Every option in this parser should appear in .yaml config file.
-
+    可以在執行訓練或推論腳本時，臨時指定：
+	•	config 檔路徑
+	•	資料路徑
+	•	使用的模型
+	•	推論模式
+	•	augmentation 方法
+	•	超參數(learning rate、epoch、batch size…)
+	•	是否使用 wandb、gradient clipping、decoder checkpoint…
     Returns:
         A parser.
     """
