@@ -13,15 +13,15 @@ from models.ffn import FFN
 class IDDecoder(nn.Module):
     def __init__(
             self,
-            feature_dim: int,
-            id_dim: int,
-            ffn_dim_ratio: int,
-            num_layers: int,
-            head_dim: int,
-            num_id_vocabulary: int,
-            rel_pe_length: int,
-            use_aux_loss: bool,
-            use_shared_aux_head: bool,
+            feature_dim: int,           # DETR 輸出的特徵維度
+            id_dim: int,                # ID embedding 維度
+            ffn_dim_ratio: int,         # FFN 的維度比率，實際維度為 (feature_dim + id_dim) * ffn_dim_ratio
+            num_layers: int,            # Transformer 的層數
+            head_dim: int,              # Multi-head Attention 的 head 維度
+            num_id_vocabulary: int,     # ID label 的詞彙表大小，包含一個額外的「未知」ID，即論文中的K
+            rel_pe_length: int,         # 相對位置嵌入的長度，表示最多考慮多少個時間步的相對位置
+            use_aux_loss: bool,         # 是否使用輔助損失來訓練 ID 頭
+            use_shared_aux_head: bool,  # 是否使用共享的輔助頭來計算 ID 頭的輔助損失
     ):
         super().__init__()
 
@@ -37,6 +37,7 @@ class IDDecoder(nn.Module):
         self.use_aux_loss = use_aux_loss
         self.use_shared_aux_head = use_shared_aux_head
 
+        # 將 One-hot ID label 映射到一個 id_dim 維的向量，形成所謂的「ID embedding」就是id_learnable dictionary。
         self.word_to_embed = nn.Linear(self.num_id_vocabulary + 1, self.id_dim, bias=False)
         embed_to_word = nn.Linear(self.id_dim, self.num_id_vocabulary + 1, bias=False)
 
@@ -46,32 +47,36 @@ class IDDecoder(nn.Module):
             self.embed_to_word_layers = nn.ModuleList([embed_to_word for _ in range(self.num_layers)])
         pass
 
-        # Related Position Embeddings:
+        # 相對位置嵌入 (Relative Positional Embedding):
         self.rel_pos_embeds = nn.Parameter(
             torch.zeros((self.num_layers, self.rel_pe_length, self.n_heads), dtype=torch.float32)
         )
-        # Prepare others for rel pe:
-        t_idxs = torch.arange(self.rel_pe_length, dtype=torch.int64)
-        curr_t_idxs, traj_t_idxs = torch.meshgrid([t_idxs, t_idxs])
-        self.rel_pos_map = (curr_t_idxs - traj_t_idxs)      # [curr_t_idx, traj_t_idx] -> rel_pos, like [1, 0] = 1
+        # Prepare others for rel pe 建立一個「相對時間差」對應表:
+        t_idxs = torch.arange(self.rel_pe_length, dtype=torch.int64) # 建立一個從 0 到 rel_pe_length - 1 的時間索引序列
+        curr_t_idxs, traj_t_idxs = torch.meshgrid([t_idxs, t_idxs])  # 建立一個二維網格，表示當前時間索引和軌跡時間索引的所有可能組合
+        self.rel_pos_map = (curr_t_idxs - traj_t_idxs)      # [curr_t_idx, traj_t_idx] -> rel_pos, like [1, 0] = 1 這一步產生的是一張「相對位置差值圖」
+        # 此時即可透過 self.rel_pos_map[a, b] 查出「query 時間 = a、key 時間 = b」時的相對時間差
         pass
 
+        # 初始化 Self-Attention 層
         self_attn = nn.MultiheadAttention(
-            embed_dim=self.feature_dim + self.id_dim,
-            num_heads=self.n_heads,
-            dropout=0.0,
-            batch_first=True,
-            add_zero_attn=True,
+            embed_dim=self.feature_dim + self.id_dim,   # Attention 的輸入維度(即論文中的2C) 
+            num_heads=self.n_heads,                     # 多頭注意力中的 head 數目
+            dropout=0.0,                                # 注意力機制中的 dropout 機率 
+            batch_first=True,                           # 設置為 True 以便輸入和輸出張量的形狀為 (batch_size, seq_len, embed_dim)
+            add_zero_attn=True,                         # 在 attention 中額外加入一個全 0 向量，允許模型選擇「不關注任何一個輸入」
         )
-        self_attn_norm = nn.LayerNorm(self.feature_dim + self.id_dim)
+        self_attn_norm = nn.LayerNorm(self.feature_dim + self.id_dim) # 對 Self-Attention 的輸出進行層歸一化
+        # 初始化 Cross-Attention 層
         cross_attn = nn.MultiheadAttention(
-            embed_dim=self.feature_dim + self.id_dim,
-            num_heads=self.n_heads,
+            embed_dim=self.feature_dim + self.id_dim,   
+            num_heads=self.n_heads,                     
             dropout=0.0,
             batch_first=True,
             add_zero_attn=True,
         )
         cross_attn_norm = nn.LayerNorm(self.feature_dim + self.id_dim)
+        # 初始化 Feed-Forward Network (FFN) 層
         ffn = FFN(
             d_model=self.feature_dim + self.id_dim,
             d_ffn=(self.feature_dim + self.id_dim) * self.ffn_dim_ratio,
@@ -86,15 +91,22 @@ class IDDecoder(nn.Module):
         self.ffn_layers = _get_clones(ffn, self.num_layers)
         self.ffn_norm_layers = _get_clones(ffn_norm, self.num_layers)
 
-        # Init parameters:
+        # 對 IDDecoder 模組中「除了相對位置嵌入以外的所有參數」，進行 Xavier 初始化:
         for n, p in self.named_parameters():
+        '''
+        遍歷整個 IDDecoder 裡所有 nn.Parameter
+            n: 該參數的名稱字串
+            p: 該參數的實際權重 Tensor（如 weight: torch.Size([256, 256])）
+        '''
+            # 只針對「矩陣類型參數」
             if p.dim() > 1 and "rel_pos_embeds" not in n:
-                nn.init.xavier_uniform_(p)
+                nn.init.xavier_uniform_(p) # Xavier initialization，又叫 Glorot uniform，讓輸入與輸出變異數一致，有利於訓練初期的穩定性
 
         pass
 
     def forward(self, seq_info, use_decoder_checkpoint):
-        trajectory_features = seq_info["trajectory_features"]
+        # 產生兩組嵌入（embedding）
+        trajectory_features = seq_info["trajectory_features"]   
         unknown_features = seq_info["unknown_features"]
         trajectory_id_labels = seq_info["trajectory_id_labels"]
         unknown_id_labels = seq_info["unknown_id_labels"] if "unknown_id_labels" in seq_info else None
@@ -105,10 +117,14 @@ class IDDecoder(nn.Module):
         _B, _G, _T, _N, _ = trajectory_features.shape
         _curr_B, _curr_G, _curr_T, _curr_N, _ = unknown_features.shape
 
+        # 把每個過去物件的 ID 編號轉成向量，作為「身分提示」
         trajectory_id_embeds = self.id_label_to_embed(id_labels=trajectory_id_labels)
+        # 先放一個 “newborn” ID embedding（即論文中的 i_spec）
         unknown_id_embeds = self.generate_empty_id_embed(unknown_features=unknown_features)
 
+        # trajectory_embeds: 歷史軌跡資料 + 對應的 ID 嵌入（有標籤）
         trajectory_embeds = torch.cat([trajectory_features, trajectory_id_embeds], dim=-1)
+        # unknown_embeds: 當前畫面偵測物件 + 空白 ID 嵌入（準備預測）
         unknown_embeds = torch.cat([unknown_features, unknown_id_embeds], dim=-1)
 
         # Prepare some common variables:
