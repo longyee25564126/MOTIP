@@ -128,14 +128,23 @@ class IDDecoder(nn.Module):
         unknown_embeds = torch.cat([unknown_features, unknown_id_embeds], dim=-1)
 
         # Prepare some common variables:
+        # 遮住一些「無效軌跡」（padding 的，告訴 Transformer：這些 token 是假的，請不要計算它們的 attention，也不要預測它們的 ID。
+	    # 禁止模型偷看「未來幀」（你不能預測 ID 的時候還去看答案本身）
+
         self_attn_key_padding_mask = einops.rearrange(unknown_masks, "b g t n -> (b g t) n").contiguous()
         cross_attn_key_padding_mask = einops.rearrange(trajectory_masks, "b g t n -> (b g) (t n)").contiguous()
+
+        # 把每個時間幀裡的所有 N 個物件攤平成單一維度 → 總共 T * N 個軌跡時間
         _trajectory_times_flatten = einops.rearrange(trajectory_times, "b g t n -> (b g) (t n)")
+        # 一樣道理，只是對象換成 unknown detections
         _unknown_times_flatten = einops.rearrange(unknown_times, "b g t n -> (b g) (t n)")
+        # 看誰在未來 → 遮掉
         cross_attn_mask = _trajectory_times_flatten[:, None, :] >= _unknown_times_flatten[:, :, None]
         cross_attn_mask = einops.repeat(cross_attn_mask, "bg tn1 tn2 -> (bg n_heads) tn1 tn2", n_heads=self.n_heads).contiguous()
-        # Prepare for rel PE:
+        # Prepare for rel PE :
+        # 先前初始化好的 rel_pos_map（一張查表地圖）搬到 GPU 上
         self.rel_pos_map = self.rel_pos_map.to(trajectory_features.device)
+        # 建構所有 query-key 配對時間對
         rel_pe_idx_pairs = torch.stack([
             torch.stack(
                 torch.meshgrid([_unknown_times_flatten[_], _trajectory_times_flatten[_]]), dim=-1
@@ -183,15 +192,19 @@ class IDDecoder(nn.Module):
                     cross_attn_mask=cross_attn_mask,
                     rel_pe_idx=rel_pe_idxs,
                 )
-
+            # 把 decoder 第 layer 層輸出的 ID embedding 轉成 每個物件對所有 ID 的預測分數（logits）
             _unknown_id_logits = self.embed_to_word_layers[layer](unknown_embeds[..., -self.id_dim:])
+            # 儲存對應的 mask
             _unknown_id_masks = unknown_masks.clone()
+            # 訓練時保留 unknown_id_labels 作為真實答案
             _unknown_id_labels = None if not self.training else unknown_id_labels
+            # 當還沒蒐集任何 logits 時，初始化：
             if all_unknown_id_logits is None:
                 all_unknown_id_logits = _unknown_id_logits
                 all_unknown_id_labels = _unknown_id_labels
                 all_unknown_id_masks = _unknown_id_masks
             else:
+                # 接下來的每一層，把每一層的 logits / labels / masks 都 torch.cat() 起來
                 all_unknown_id_logits = torch.cat([all_unknown_id_logits, _unknown_id_logits], dim=0)
                 all_unknown_id_labels = torch.cat([all_unknown_id_labels, _unknown_id_labels], dim=0) if _unknown_id_labels is not None else None
                 all_unknown_id_masks = torch.cat([all_unknown_id_masks, _unknown_id_masks], dim=0)
@@ -201,18 +214,21 @@ class IDDecoder(nn.Module):
         else:
             return _unknown_id_logits, _unknown_id_labels, _unknown_id_masks
 
+
     def _forward_a_layer(
             self,
-            layer: int,
-            unknown_embeds: torch.Tensor,
-            trajectory_embeds: torch.Tensor,
-            self_attn_key_padding_mask: torch.Tensor,
-            cross_attn_key_padding_mask: torch.Tensor,
-            cross_attn_mask: torch.Tensor,
-            rel_pe_idx: torch.Tensor,
+            layer: int,                                 # 第幾層 decoder（從 0 開始）
+            unknown_embeds: torch.Tensor,               # 當前幀中待預測物件的 feature + 空 ID embedding（shape: B, G, T, N, C）
+            trajectory_embeds: torch.Tensor,            # 歷史軌跡物件的 feature + 已知 ID embedding
+            self_attn_key_padding_mask: torch.Tensor,   # self-attn 遮罩（只針對當前物件）
+            cross_attn_key_padding_mask: torch.Tensor,  # cross-attn 遮罩（針對歷史軌跡中的 padding）
+            cross_attn_mask: torch.Tensor,              # 禁止注意未來的遮罩 + rel PE bias
+            rel_pe_idx: torch.Tensor,                   # 每個 (query, key) 對的時間差索引，用來查表
     ):
         _B, _G, _T, _N, _ = trajectory_embeds.shape
         _curr_B, _curr_G, _curr_T, _curr_N, _ = unknown_embeds.shape
+        # 只有在第 2 層（layer > 0）以後才會做 self-attention
+        # 原因：第一層的輸入還未經歷任何上下文交互，直接進行 cross-attention
         if layer > 0:   # use self-attention to transfer information between unknown features (same time step)
             self_unknown_embeds = einops.rearrange(unknown_embeds, "b g t n c -> (b g t) n c").contiguous()
             self_out, _ = self.self_attn_layers[layer - 1](
@@ -222,7 +238,8 @@ class IDDecoder(nn.Module):
             self_out = self_unknown_embeds + self_out
             self_out = self.self_attn_norm_layers[layer - 1](self_out)
             unknown_embeds = einops.rearrange(self_out, "(b g t) n c -> b g t n c", b=_B, g=_G, t=_curr_T)
-
+            
+        # 讓當前的 detection 向歷史軌跡的物件「查詢」資訊（跨時間與 ID）
         # Cross-attention for in-context decoding:
         cross_unknown_embeds = einops.rearrange(unknown_embeds, "b g t n c -> (b g) (t n) c").contiguous()
         cross_trajectory_embeds = einops.rearrange(trajectory_embeds, "b g t n c -> (b g) (t n) c").contiguous()
