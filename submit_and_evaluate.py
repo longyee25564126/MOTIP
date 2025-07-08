@@ -24,11 +24,14 @@ from models.misc import load_checkpoint
 def submit_and_evaluate(config: dict):
     # Init Accelerator at beginning:
     accelerator = Accelerator()
+    #  PartialState 是 accelerate 中的 底層狀態控制類別，用來判斷目前這個程式執行在哪一張 GPU（或哪一個分散式節點上）
     state = PartialState()
 
     mode = config["INFERENCE_MODE"]
+    # 檢查模式參數，只能是 "submit" 或 "evaluate"
     assert mode in ["submit", "evaluate"], f"Mode {mode} is not supported."
     # Generate the output dir:
+    # 確保 config 設定中有給定 OUTPUTS_DIR，而且不能是 None
     assert "OUTPUTS_DIR" in config and config["OUTPUTS_DIR"] is not None, "OUTPUTS_DIR is not set."
     outputs_dir = config["OUTPUTS_DIR"]
     inference_group = config["INFERENCE_GROUP"]
@@ -75,8 +78,9 @@ def submit_and_evaluate(config: dict):
         from models.misc import load_previous_checkpoint
         load_previous_checkpoint(model, path=config["INFERENCE_MODEL"])
 
+    # 根據設定檔 config，建立出整個 MOTIP 模型結構
     model = accelerator.prepare(model)
-
+    # 如果是 evaluate 模式，這個變數會收到一個 Metrics 物件（包含 HOTA, MOTA, IDF1 等結果）
     metrics = submit_and_evaluate_one_model(
         is_evaluate=config["INFERENCE_MODE"] == "evaluate",
         accelerator=accelerator,
@@ -100,7 +104,7 @@ def submit_and_evaluate(config: dict):
         else config["ONLY_DETR"],
         dtype=config.get("INFERENCE_DTYPE", "FP32"),
     )
-
+    # 如果只是 submit 模式，會回傳 None，單純只輸出 tracker/*.txt
     if metrics is not None:
         metrics.sync()
         logger.metrics(
@@ -137,7 +141,7 @@ def submit_and_evaluate_one_model(
         inference_only_detr: bool = False,
         dtype: str = "FP32",
 ):
-    # Build the datasets:
+    # Build the datasets 依照你的 dataset 名稱與路徑，初始化「推論用的資料集」，不載入 ground truth，僅供前向推論（inference）使用:
     inference_dataset = dataset_classes[dataset](
         data_root=data_root,
         split=data_split,
@@ -153,6 +157,8 @@ def submit_and_evaluate_one_model(
     _inference_sequence_names.sort()
     # If we have multiple GPUs, we need to filter out the sequences that will not be processed in this GPU:
     # However, there is a special case that the number of GPUs is larger than the number of sequences:
+    # 「多 GPU / 多進程環境下」，將不同影片序列（sequence）分配給不同的進程處理。這是為了加速推論，並且避免同一序列重複處理
+    # 序列數量比 GPU 數量還少，例如 2 段影片但有 4 張 GPU
     if len(_inference_sequence_names) <= state.process_index:
         logger.info(
             log=f"Number of sequences is smaller than the number of processes, "
