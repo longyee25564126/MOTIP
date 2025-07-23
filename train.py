@@ -285,17 +285,18 @@ def train_one_epoch(
         is_last_epochs: bool = False,
         multi_last_checkpoints: int = 0,
 ):
-    current_last_checkpoint_idx = 0
+    # 初始化這一輪訓練 epoch 所需的時間計算、記錄器、梯度與裝置設定等環境，並建立 batch 大小與 GT 數量統計變數
+    current_last_checkpoint_idx = 0 #這個變數就負責記錄目前要儲存的是第幾個 checkpoint
 
     model.train()
-    tps = TPS()     # time per step
-    metrics = Metrics()
-    optimizer.zero_grad()
-    step_timestamp = tps.timestamp()
-    device = accelerator.device
-    _B = dataloader.batch_sampler.batch_size
+    tps = TPS()     # time per step 每一個 training step 完成後會更新一下時間，幫助估算整個 epoch 的 ETA（預估剩餘時間）
+    metrics = Metrics()     # 收集各種訓練數值
+    optimizer.zero_grad()   # 清空上一次訓練留下來的梯度
+    step_timestamp = tps.timestamp() # 現在的時間戳記下來，用於後續計算「每個 step 花多久」
+    device = accelerator.device     # Huggingface Accelerator 拿出你現在使用的裝
+    _B = dataloader.batch_sampler.batch_size    # _B 是 batch size，也就是你每次丟進模型的樣本數（應該對應一段影片序列）
     _num_gts_per_frame = 0
-
+    #---------------------------------------------------------------------------------------------------------------
     # Prepare for gradient clip norm:
     model_without_ddp = get_model(model)
     detr_params = []
