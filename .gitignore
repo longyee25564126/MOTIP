@@ -1,4 +1,57 @@
-# Root gitignore file
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.egg-info/
+dist/
+build/
 
-# PyCharm
+# Jupyter
+.ipynb_checkpoints/
+
+# Environments
+.env
+.venv/
+venv/
+env/
+.conda/
+
+# IDEs
 .idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and outputs
+outputs/
+runs/
+wandb/
+*.log
+
+# Data and checkpoints
+datasets/
+data_cache/
+pretrained/
+pretrains/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+*.plan
+
+# TrackEval artifacts
+TrackEval/**/results/
+TrackEval/**/plots/
+TrackEval/**/temp/
+
+# Compiled ops (Deformable Attention)
+models/ops/build/
+models/ops/**/*.so
+models/ops/**/*.o
+models/ops/**/*.a

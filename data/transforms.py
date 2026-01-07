@@ -449,6 +449,79 @@ class GenerateIDLabels:
         return images, annotations, metas
 
 
+class GenerateIDLabelsNoVocab:
+    def __init__(self, aug_num_groups: int, num_training_ids: int | None = None):
+        self.aug_num_groups = aug_num_groups
+        self.num_training_ids = num_training_ids
+
+    def __call__(self, images, annotations, metas):
+        _T = len(images)
+        _G = self.aug_num_groups
+        # Collect all IDs:
+        ids_set = set()
+        for annotation in annotations:
+            ids_set.update(set(annotation["id"].tolist()))
+        _N = len(ids_set)
+
+        # ID anns consist of the following parts:
+        # (1): a (_G, _T, _N) tensor, representing the ID labels of each object in each frame.
+        # (2): a (_G, _T, _N) tensor, representing the corresponding index of each object in detection annotations.
+        # (3): a (_G, _T, _N) tensor, representing the mask of ID labels in each frame.
+        # (4): a (_G, _T, _N) tensor, representing the time index of each object.
+
+        ids_list = list(ids_set)
+        id_to_idx = {ids_list[_]: _ for _ in range(_N)}     # the idx in the final ID labels
+        base_id_masks = torch.ones((_T, _N), dtype=torch.bool)
+        base_ann_idxs = - torch.ones((_T, _N), dtype=torch.int64)
+        # These "base" ID anns are used to generate the final ID anns, do not directly use them.
+        for t in range(_T):
+            annotation = annotations[t]
+            for i in range(len(annotation["id"])):
+                _id = annotation["id"][i].item()
+                _ann_idx = i
+                _n = id_to_idx[_id]
+                # generate the corresponding ID ann:
+                base_id_masks[t, _n] = False
+                base_ann_idxs[t, _n] = _ann_idx
+
+        # Cap the number of training IDs if requested.
+        if self.num_training_ids is not None and self.num_training_ids > 0 and _N > self.num_training_ids:
+            _random_select_idxs = torch.randperm(_N)[:self.num_training_ids]
+            base_id_masks = base_id_masks[:, _random_select_idxs]
+            base_ann_idxs = base_ann_idxs[:, _random_select_idxs]
+            _N = self.num_training_ids
+            pass
+        # Normal processing:
+        id_labels = torch.zeros((_G, _T, _N), dtype=torch.int64)
+        id_masks = torch.ones((_G, _T, _N), dtype=torch.bool)
+        ann_idxs = - torch.ones((_G, _T, _N), dtype=torch.int64)
+        for group in range(_G):
+            _random_id_labels = torch.randperm(_N)[:_N]
+            _random_id_labels = _random_id_labels[None, ...].repeat(_T, 1)
+            id_labels[group] = _random_id_labels.clone()
+            id_masks[group] = base_id_masks.clone()
+            ann_idxs[group] = base_ann_idxs.clone()
+        # Generate the time indexes:
+        times = torch.arange(_T, dtype=torch.int64)[None, :, None].repeat(_G, 1, _N)
+        # Check the shapes:
+        assert id_labels.shape == id_masks.shape == ann_idxs.shape == times.shape
+
+        # Split the ID anns into each frame:
+        id_labels_list = torch.split(id_labels, split_size_or_sections=1, dim=1)    # each item is in (_G, 1, _N)
+        id_masks_list = torch.split(id_masks, split_size_or_sections=1, dim=1)      # each item is in (_G, 1, _N)
+        ann_idxs_list = torch.split(ann_idxs, split_size_or_sections=1, dim=1)      # each item is in (_G, 1, _N)
+        times_list = torch.split(times, split_size_or_sections=1, dim=1)            # each item is in (_G, 1, _N)
+
+        # Update the annotations (put the ID anns into the annotations):
+        for t in range(_T):
+            annotations[t]["id_labels"] = id_labels_list[t]
+            annotations[t]["id_masks"] = id_masks_list[t]
+            annotations[t]["ann_idxs"] = ann_idxs_list[t]
+            annotations[t]["times"] = times_list[t]
+        pass
+        return images, annotations, metas
+
+
 class TurnIntoTrajectoryAndUnknown:
     def __init__(
             self,
@@ -575,6 +648,133 @@ class TurnIntoTrajectoryAndUnknown:
         return images, annotations, metas
 
 
+class TurnIntoTrajectoryAndUnknownNoVocab:
+    def __init__(
+            self,
+            aug_trajectory_occlusion_prob: float,
+            aug_trajectory_switch_prob: float,
+    ):
+        self.aug_trajectory_occlusion_prob = aug_trajectory_occlusion_prob
+        self.aug_trajectory_switch_prob = aug_trajectory_switch_prob
+        return
+
+    def __call__(self, images, annotations, metas):
+        id_labels = torch.cat([annotation["id_labels"] for annotation in annotations], dim=1)
+        id_masks = torch.cat([annotation["id_masks"] for annotation in annotations], dim=1)
+        ann_idxs = torch.cat([annotation["ann_idxs"] for annotation in annotations], dim=1)
+        times = torch.cat([annotation["times"] for annotation in annotations], dim=1)
+        _G, _T, _N = id_labels.shape
+        newborn_label = _N
+        # Del these fields from the annotations:
+        for t in range(_T):
+            del annotations[t]["id_labels"]
+            del annotations[t]["id_masks"]
+            del annotations[t]["ann_idxs"]
+            del annotations[t]["times"]
+
+        # Copy the ID anns to "trajectory_" and "unknown_":
+        trajectory_id_labels = id_labels.clone()
+        trajectory_id_masks = id_masks.clone()
+        trajectory_ann_idxs = ann_idxs.clone()
+        trajectory_times = times.clone()
+        unknown_id_labels = id_labels.clone()
+        unknown_id_masks = id_masks.clone()
+        unknown_ann_idxs = ann_idxs.clone()
+        unknown_times = times.clone()
+
+        if self.aug_trajectory_occlusion_prob > 0.0:
+            # Make trajectory occlusion:
+            # 1. Turn the shape into (_G * _N, _T):
+            trajectory_id_masks = einops.rearrange(trajectory_id_masks, "G T N -> (G N) T")
+            unknown_id_masks = einops.rearrange(unknown_id_masks, "G T N -> (G N) T")
+            # 2. Generate the occlusion mask:
+            trajectory_occlusion_masks = torch.zeros_like(trajectory_id_masks, dtype=torch.bool)
+            unknown_occlusion_masks = torch.zeros_like(unknown_id_masks, dtype=torch.bool)
+            for i in range(_G * _N):
+                if random.random() < self.aug_trajectory_occlusion_prob:
+                    begin_idx = random.randint(0, _T - 1)
+                    _max_T = _T - 1 - begin_idx
+                    end_idx = begin_idx + math.ceil(_max_T * random.random())
+                    trajectory_occlusion_masks[i, begin_idx:end_idx] = True
+                    unknown_occlusion_masks[i, begin_idx:end_idx] = True
+            # 3. Apply the occlusion mask:
+            trajectory_id_masks = trajectory_id_masks | trajectory_occlusion_masks
+            unknown_id_masks = unknown_id_masks | unknown_occlusion_masks
+            # 4. Turn the shape back:
+            trajectory_id_masks = einops.rearrange(trajectory_id_masks, "(G N) T -> G T N", G=_G, N=_N)
+            unknown_id_masks = einops.rearrange(unknown_id_masks, "(G N) T -> G T N", G=_G, N=_N)
+
+        if self.aug_trajectory_switch_prob > 0.0:
+            # Make trajectory switch:
+            # 1. Turn the shape into (_G * _T, _N):
+            trajectory_id_labels = einops.rearrange(trajectory_id_labels, "G T N -> (G T) N")
+            trajectory_id_masks = einops.rearrange(trajectory_id_masks, "G T N -> (G T) N")
+            trajectory_ann_idxs = einops.rearrange(trajectory_ann_idxs, "G T N -> (G T) N")
+            # 2. Switch for each frame:
+            #    (switching the ID labels is the same as switching the ann_idxs and masks)
+            for g_t in range(_G * _T):
+                switch_p = torch.ones((_N, )) * self.aug_trajectory_switch_prob
+                switch_map = torch.bernoulli(switch_p)
+                switch_idxs = torch.nonzero(switch_map)[:, 0]
+                if len(switch_idxs) > 1:    # make sure can be switched
+                    shuffled_switch_idxs = switch_idxs[torch.randperm(len(switch_idxs))]
+                    # Do switch:
+                    trajectory_ann_idxs[g_t, switch_idxs] = trajectory_ann_idxs[g_t, shuffled_switch_idxs]
+                    trajectory_id_masks[g_t, switch_idxs] = trajectory_id_masks[g_t, shuffled_switch_idxs]
+                    pass
+                pass
+            # 3. Turn the shape back:
+            trajectory_id_labels = einops.rearrange(trajectory_id_labels, "(G T) N -> G T N", G=_G, T=_T)
+            trajectory_id_masks = einops.rearrange(trajectory_id_masks, "(G T) N -> G T N", G=_G, T=_T)
+            trajectory_ann_idxs = einops.rearrange(trajectory_ann_idxs, "(G T) N -> G T N", G=_G, T=_T)
+            pass
+
+        # Check all ID labels are legal:
+        assert torch.all(trajectory_id_labels >= 0)
+        assert torch.all(trajectory_id_labels < _N)
+        assert torch.all(unknown_id_labels >= 0)
+        assert torch.all(unknown_id_labels < _N)
+
+        # Add "newborn" ID label to unknown ID labels for supervision:
+        # 1. Turn the shape into (_G * _N, _T):
+        trajectory_id_labels = einops.rearrange(trajectory_id_labels, "G T N -> (G N) T")
+        trajectory_id_masks = einops.rearrange(trajectory_id_masks, "G T N -> (G N) T")
+        unknown_id_labels = einops.rearrange(unknown_id_labels, "G T N -> (G N) T")
+        unknown_id_masks = einops.rearrange(unknown_id_masks, "G T N -> (G N) T")
+        # 2. Calculate the already_born masks:
+        already_born_masks = torch.cumsum(~trajectory_id_masks, dim=1)
+        already_born_masks = already_born_masks > 0
+        # 3. Generate the newborn ID labels:
+        newborn_id_label_masks = ~ torch.cat(
+            [
+                torch.zeros((_G * _N, 1), dtype=torch.bool),
+                already_born_masks[:, :-1]
+            ],
+            dim=-1
+        )
+        unknown_id_labels[newborn_id_label_masks] = newborn_label
+        # 4. Turn the shape back:
+        trajectory_id_labels = einops.rearrange(trajectory_id_labels, "(G N) T -> G T N", G=_G, N=_N)
+        trajectory_id_masks = einops.rearrange(trajectory_id_masks, "(G N) T -> G T N", G=_G, N=_N)
+        unknown_id_labels = einops.rearrange(unknown_id_labels, "(G N) T -> G T N", G=_G, N=_N)
+        unknown_id_masks = einops.rearrange(unknown_id_masks, "(G N) T -> G T N", G=_G, N=_N)
+        assert torch.all(unknown_id_labels >= 0)
+        assert torch.all(unknown_id_labels <= newborn_label)
+
+        # Update the annotations:
+        for t in range(_T):
+            annotations[t]["trajectory_id_labels"] = trajectory_id_labels[:, t:t+1, :]
+            annotations[t]["trajectory_id_masks"] = trajectory_id_masks[:, t:t+1, :]
+            annotations[t]["trajectory_ann_idxs"] = trajectory_ann_idxs[:, t:t+1, :]
+            annotations[t]["trajectory_times"] = trajectory_times[:, t:t+1, :]
+            annotations[t]["unknown_id_labels"] = unknown_id_labels[:, t:t+1, :]
+            annotations[t]["unknown_id_masks"] = unknown_id_masks[:, t:t+1, :]
+            annotations[t]["unknown_ann_idxs"] = unknown_ann_idxs[:, t:t+1, :]
+            annotations[t]["unknown_times"] = unknown_times[:, t:t+1, :]
+
+        return images, annotations, metas
+
+
 def build_transforms(config: dict):
     # mean = [0.485, 0.456, 0.406]
     # std = [0.229, 0.224, 0.225]
@@ -608,13 +808,11 @@ def build_transforms(config: dict):
         # MultiNormalize(mean=mean, std=std),
         MultiNormalizeBoundingBoxes(),
         # For MOTIP, biding ID labels:
-        GenerateIDLabels(
-            num_id_vocabulary=config["NUM_ID_VOCABULARY"],
+        GenerateIDLabelsNoVocab(
             aug_num_groups=config["AUG_NUM_GROUPS"],
-            num_training_ids=config.get("NUM_TRAINING_IDS", config["NUM_ID_VOCABULARY"]),
+            num_training_ids=config.get("NUM_TRAINING_IDS"),
         ),
-        TurnIntoTrajectoryAndUnknown(
-            num_id_vocabulary=config["NUM_ID_VOCABULARY"],
+        TurnIntoTrajectoryAndUnknownNoVocab(
             aug_trajectory_occlusion_prob=config["AUG_TRAJECTORY_OCCLUSION_PROB"],
             aug_trajectory_switch_prob=config["AUG_TRAJECTORY_SWITCH_PROB"],
         ),

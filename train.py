@@ -15,6 +15,7 @@ from typing import Any, Generator, List
 
 from models.motip import build as build_motip
 from models.motip.id_criterion import build as build_id_criterion
+from models.himot import build_reid_criterion
 from runtime_option import runtime_option
 from utils.misc import yaml_to_dict, set_seed
 from configs.util import load_super_config, update_config
@@ -107,6 +108,7 @@ def train_engine(config: dict):
     )
     # Build Loss Function:
     id_criterion = build_id_criterion(config=config)
+    reid_criterion = build_reid_criterion(config=config)
 
     # Build Optimizer:
     if config["DETR_NUM_TRAIN_FRAMES"] == 0:
@@ -171,6 +173,7 @@ def train_engine(config: dict):
             model=model,
             detr_criterion=detr_criterion,
             id_criterion=id_criterion,
+            reid_criterion=reid_criterion,
             optimizer=optimizer,
             only_detr=only_detr,
             lr_warmup_epochs=config["LR_WARMUP_EPOCHS"],
@@ -267,6 +270,7 @@ def train_one_epoch(
         model,
         detr_criterion,
         id_criterion,
+        reid_criterion,
         optimizer,
         only_detr,
         lr_warmup_epochs: int,
@@ -410,6 +414,12 @@ def train_one_epoch(
 
         # DETR criterion:
         detr_loss_dict, detr_indices = detr_criterion(outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len)
+        # ReID criterion:
+        reid_loss_dict = reid_criterion(
+            detr_outputs=detr_outputs,
+            annotations=annotations,
+            detr_indices=detr_indices,
+        )
 
         # Whether to only train the DETR, OR to train the MOTIP together:
         if not only_detr:
@@ -437,10 +447,11 @@ def train_one_epoch(
             detr_loss = sum(
                 detr_loss_dict[k] * detr_weight_dict[k] for k in detr_loss_dict.keys() if k in detr_weight_dict
             )
-            loss = detr_loss + (id_loss if id_loss is not None else 0) * id_criterion.weight
+            loss = detr_loss + reid_loss_dict["loss_reid"] + (id_loss if id_loss is not None else 0) * id_criterion.weight
             # Logging losses:
             metrics.update(name="loss", value=loss.item())
             metrics.update(name="detr_loss", value=detr_loss.item())
+            metrics.update(name="loss_reid", value=reid_loss_dict["loss_reid"].item())
             if id_loss is not None:
                 metrics.update(name="id_loss", value=id_loss.item())
             for k, v in detr_loss_dict.items():

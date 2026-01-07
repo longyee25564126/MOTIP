@@ -25,6 +25,7 @@ from utils.misc import is_distributed, distributed_world_size
 #                        is_dist_avail_and_initialized, inverse_sigmoid)
 
 from models.deformable_detr.backbone import build_backbone
+from models.himot.reid_head import ReIDHead
 from .matcher import build_matcher
 from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
                            dice_loss, sigmoid_focal_loss)
@@ -39,7 +40,7 @@ def _get_clones(module, N):
 class DeformableDETR(nn.Module):
     """ This is the Deformable DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, two_stage=False):
+                 aux_loss=True, with_box_refine=False, two_stage=False, reid_backprop_mode: str = "head_only"):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -58,6 +59,15 @@ class DeformableDETR(nn.Module):
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
+        self.reid_head = ReIDHead(
+            input_dim=hidden_dim,
+            embed_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            num_layers=2,
+            dropout=0.0,
+            use_layer_norm=True,
+            l2norm=True,
+        )
         if not two_stage:
             self.query_embed = nn.Embedding(num_queries, hidden_dim*2)
         if num_feature_levels > 1:
@@ -86,6 +96,7 @@ class DeformableDETR(nn.Module):
         self.aux_loss = aux_loss
         self.with_box_refine = with_box_refine
         self.two_stage = two_stage
+        self.reid_backprop_mode = reid_backprop_mode.lower()
 
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
@@ -192,6 +203,14 @@ class DeformableDETR(nn.Module):
         # Output the outputs of last decoder layer.
         # We need these outputs to generate the embeddings for objects.
         out["outputs"] = hs[-1]
+        if self.reid_backprop_mode == "head_only":
+            out["reid_emb"] = self.reid_head(hs[-1].detach())
+        elif self.reid_backprop_mode == "full":
+            out["reid_emb"] = self.reid_head(hs[-1])
+        elif self.reid_backprop_mode == "none":
+            out["reid_emb"] = self.reid_head(hs[-1]).detach()
+        else:
+            raise ValueError(f"Unknown REID_BACKPROP_MODE: {self.reid_backprop_mode}")
         return out
 
     @torch.jit.unused
@@ -509,6 +528,7 @@ def build(args):
         aux_loss=args.aux_loss,
         with_box_refine=args.with_box_refine,
         two_stage=args.two_stage,
+        reid_backprop_mode=getattr(args, "reid_backprop_mode", "head_only"),
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
@@ -540,4 +560,3 @@ def build(args):
             postprocessors["panoptic"] = PostProcessPanoptic(is_thing_map, threshold=0.85)
 
     return model, criterion, postprocessors
-
