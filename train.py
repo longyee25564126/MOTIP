@@ -13,9 +13,8 @@ from collections import defaultdict
 from torchvision.transforms import v2
 from typing import Any, Generator, List
 
-from models.motip import build as build_motip
-from models.motip.id_criterion import build as build_id_criterion
-from models.himot import build_reid_criterion
+from models.himot import build_himot
+from models.himot import build_reid_criterion, build_td_criterion
 from runtime_option import runtime_option
 from utils.misc import yaml_to_dict, set_seed
 from configs.util import load_super_config, update_config
@@ -96,8 +95,8 @@ def train_engine(config: dict):
         "global_step": 0
     }
 
-    # Build MOTIP model:
-    model, detr_criterion = build_motip(config=config)
+    # Build HiMOT model:
+    model, detr_criterion = build_himot(config=config)
     # Load the pre-trained DETR:
     load_detr_pretrain(
         model=model, pretrain_path=config["DETR_PRETRAIN"], num_classes=config["NUM_CLASSES"],
@@ -107,14 +106,14 @@ def train_engine(config: dict):
         log=f"Load the pre-trained DETR from '{config['DETR_PRETRAIN']}'. "
     )
     # Build Loss Function:
-    id_criterion = build_id_criterion(config=config)
     reid_criterion = build_reid_criterion(config=config)
+    td_criterion = build_td_criterion(config=config)
 
     # Build Optimizer:
     if config["DETR_NUM_TRAIN_FRAMES"] == 0:
         for n, p in model.named_parameters():
             if "detr" in n:
-                p.requires_grad = False     # only train the MOTIP part.
+                p.requires_grad = False     # only train the HiMOT part.
     param_groups = get_param_groups(model, config)
     optimizer = AdamW(
         params=param_groups,
@@ -172,10 +171,11 @@ def train_engine(config: dict):
             dataloader=train_dataloader,
             model=model,
             detr_criterion=detr_criterion,
-            id_criterion=id_criterion,
             reid_criterion=reid_criterion,
+            td_criterion=td_criterion,
             optimizer=optimizer,
             only_detr=only_detr,
+            config=config,
             lr_warmup_epochs=config["LR_WARMUP_EPOCHS"],
             lr_warmup_tgt_lr=config["LR"],
             detr_num_train_frames=config["DETR_NUM_TRAIN_FRAMES"],
@@ -269,10 +269,11 @@ def train_one_epoch(
         dataloader: DataLoader,
         model,
         detr_criterion,
-        id_criterion,
         reid_criterion,
+        td_criterion,
         optimizer,
         only_detr,
+        config: dict,
         lr_warmup_epochs: int,
         lr_warmup_tgt_lr: float,
         detr_num_train_frames: int,
@@ -298,8 +299,6 @@ def train_one_epoch(
     step_timestamp = tps.timestamp()
     device = accelerator.device
     _B = dataloader.batch_sampler.batch_size
-    _num_gts_per_frame = 0
-
     # Prepare for gradient clip norm:
     model_without_ddp = get_model(model)
     detr_params = []
@@ -421,25 +420,29 @@ def train_one_epoch(
             detr_indices=detr_indices,
         )
 
-        # Whether to only train the DETR, OR to train the MOTIP together:
+        # Whether to only train the DETR, OR to train the TD together:
         if not only_detr:
-            _G, _, _N = annotations[0][0]["trajectory_id_labels"].shape
-            # Need to prepare for MOTIP:
-            seq_info = prepare_for_motip(
-                detr_outputs=detr_outputs, annotations=annotations, detr_indices=detr_indices,
+            seq_info = prepare_for_himot(
+                detr_outputs=detr_outputs,
+                annotations=annotations,
+                detr_indices=detr_indices,
+                config=config,
             )
-            seq_info = model(seq_info=seq_info, part="trajectory_modeling")
-            id_logits, id_gts, id_masks = model(
-                seq_info=seq_info,
-                part="id_decoder",
-                use_decoder_checkpoint=use_decoder_checkpoint,
+            td_out = model(seq_info=seq_info, part="traj_decoder")
+            td_loss_dict = td_criterion(
+                pred_reid=td_out["pred_reid"],
+                pred_delta=td_out["pred_delta"],
+                tgt_reid=seq_info["tgt_reid"],
+                tgt_delta=seq_info["tgt_delta"],
+                valid_targets_mask=seq_info["valid_tgt"],
             )
-            id_loss = id_criterion(id_logits=id_logits, id_labels=id_gts, id_masks=id_masks)
-            _num_gts_per_frame = max(_num_gts_per_frame, id_gts.shape[-1])
-            # print(f"Num of GTs per frame: {_num_gts_per_frame}")
-            pass
         else:
-            id_loss = None
+            zero = detr_outputs["pred_logits"].new_tensor(0.0)
+            td_loss_dict = {
+                "loss_td_reid": zero,
+                "loss_td_box": zero,
+                "loss_td_total": zero,
+            }
 
         # Backward:
         with accelerator.autocast():
@@ -447,13 +450,14 @@ def train_one_epoch(
             detr_loss = sum(
                 detr_loss_dict[k] * detr_weight_dict[k] for k in detr_loss_dict.keys() if k in detr_weight_dict
             )
-            loss = detr_loss + reid_loss_dict["loss_reid"] + (id_loss if id_loss is not None else 0) * id_criterion.weight
+            loss = detr_loss + reid_loss_dict["loss_reid"] + td_loss_dict["loss_td_total"]
             # Logging losses:
             metrics.update(name="loss", value=loss.item())
             metrics.update(name="detr_loss", value=detr_loss.item())
             metrics.update(name="loss_reid", value=reid_loss_dict["loss_reid"].item())
-            if id_loss is not None:
-                metrics.update(name="id_loss", value=id_loss.item())
+            metrics.update(name="loss_td_total", value=td_loss_dict["loss_td_total"].item())
+            metrics.update(name="loss_td_reid", value=td_loss_dict["loss_td_reid"].item())
+            metrics.update(name="loss_td_box", value=td_loss_dict["loss_td_box"].item())
             for k, v in detr_loss_dict.items():
                 metrics.update(name=k, value=v.item())
             loss /= accumulate_steps
@@ -665,59 +669,95 @@ def tensor_dict_index_select(tensor_dict, index, dim=0):
     return dict(res_tensor_dict)
 
 
-def prepare_for_motip(detr_outputs, annotations, detr_indices):
+def prepare_for_himot(detr_outputs, annotations, detr_indices, config: dict):
     _B, _T = len(annotations), len(annotations[0])
-    _G, _, _N = annotations[0][0]["trajectory_id_labels"].shape
-    _device = detr_outputs["pred_logits"].device
-    _feature_dim = detr_outputs["outputs"].shape[-1]
-    # Init corresponding variables:
-    trajectory_id_labels = - torch.ones((_B, _G, _T, _N), dtype=torch.int64, device=_device)
-    trajectory_times = - torch.ones((_B, _G, _T, _N), dtype=torch.int64, device=_device)
-    trajectory_masks = torch.ones((_B, _G, _T, _N), dtype=torch.bool, device=_device)
-    trajectory_boxes = torch.zeros((_B, _G, _T, _N, 4), dtype=torch.float32, device=_device)
-    trajectory_features = torch.zeros((_B, _G, _T, _N, _feature_dim), dtype=torch.float32, device=_device)
-    unknown_id_labels = - torch.ones((_B, _G, _T, _N), dtype=torch.int64, device=_device)
-    unknown_times = - torch.ones((_B, _G, _T, _N), dtype=torch.int64, device=_device)
-    unknown_masks = torch.ones((_B, _G, _T, _N), dtype=torch.bool, device=_device)
-    unknown_boxes = torch.zeros((_B, _G, _T, _N, 4), dtype=torch.float32, device=_device)
-    unknown_features = torch.zeros((_B, _G, _T, _N, _feature_dim), dtype=torch.float32, device=_device)
+    _G, _, _N = annotations[0][0]["trajectory_ann_idxs"].shape
+    _device = detr_outputs["reid_emb"].device
+    _reid_dim = detr_outputs["reid_emb"].shape[-1]
+    _history_len = config.get("TD_HISTORY_LEN", 30)
+
+    n_all = _B * _G * _N
+    reid_seq = torch.zeros((n_all, _history_len, _reid_dim), dtype=torch.float32, device=_device)
+    delta_seq = torch.zeros((n_all, _history_len, 4), dtype=torch.float32, device=_device)
+    pad_mask = torch.ones((n_all, _history_len), dtype=torch.bool, device=_device)
+    miss_mask = torch.zeros((n_all, _history_len), dtype=torch.bool, device=_device)
+    tgt_reid = torch.zeros((n_all, _reid_dim), dtype=torch.float32, device=_device)
+    tgt_delta = torch.zeros((n_all, 4), dtype=torch.float32, device=_device)
+    valid_tgt = torch.zeros((n_all,), dtype=torch.bool, device=_device)
+
+    # Pre-compute reid embeddings aligned to GT order for each frame.
+    frame_reid_by_idx = [None] * (_B * _T)
     for b in range(_B):
         for t in range(_T):
             flatten_idx = b * _T + t
-            go_back_detr_idxs = torch.argsort(detr_indices[flatten_idx][1])
-            detr_output_embeds = detr_outputs["outputs"][flatten_idx][detr_indices[flatten_idx][0][go_back_detr_idxs]]
-            detr_boxes = detr_outputs["pred_boxes"][flatten_idx][detr_indices[flatten_idx][0][go_back_detr_idxs]]
-            # detr_output_embeds = einops.repeat(detr_output_embeds, "n d -> g n d", g=_G)
-            # detr_boxes = einops.repeat(detr_boxes, "n d -> g n d", g=_G)
-            for group in range(_G):
-                _curr_traj_ann_idxs = annotations[b][t]["trajectory_ann_idxs"][group, 0, :]
-                _curr_unk_ann_idxs = annotations[b][t]["unknown_ann_idxs"][group, 0, :]
-                _curr_traj_masks = annotations[b][t]["trajectory_id_masks"][group, 0, :]
-                _curr_unk_masks = annotations[b][t]["unknown_id_masks"][group, 0, :]
-                # Fill the fields:
-                trajectory_id_labels[b, group, t] = annotations[b][t]["trajectory_id_labels"][group, 0, :]
-                unknown_id_labels[b, group, t] = annotations[b][t]["unknown_id_labels"][group, 0, :]
-                trajectory_times[b, group, t] = annotations[b][t]["trajectory_times"][group, 0, :]
-                unknown_times[b, group, t] = annotations[b][t]["unknown_times"][group, 0, :]
-                trajectory_masks[b, group, t] = _curr_traj_masks
-                unknown_masks[b, group, t] = _curr_unk_masks
-                trajectory_features[b, group, t, ~_curr_traj_masks] = detr_output_embeds[_curr_traj_ann_idxs[~_curr_traj_masks]]
-                unknown_features[b, group, t, ~_curr_unk_masks] = detr_output_embeds[_curr_unk_ann_idxs[~_curr_unk_masks]]
-                trajectory_boxes[b, group, t, ~_curr_traj_masks] = detr_boxes[_curr_traj_ann_idxs[~_curr_traj_masks]]
-                unknown_boxes[b, group, t, ~_curr_unk_masks] = detr_boxes[_curr_unk_ann_idxs[~_curr_unk_masks]]
-                pass
-            pass
+            src_idx, tgt_idx = detr_indices[flatten_idx]
+            if tgt_idx.numel() == 0:
+                continue
+            go_back = torch.argsort(tgt_idx)
+            matched_src = src_idx[go_back]
+            frame_reid_by_idx[flatten_idx] = detr_outputs["reid_emb"][flatten_idx][matched_src]
+
+    # Select target time per clip.
+    t_targets = []
+    for b in range(_B):
+        if _T > 1:
+            t_targets.append(int(torch.randint(1, _T, (1,)).item()))
+        else:
+            t_targets.append(0)
+
+    for b in range(_B):
+        t_target = t_targets[b]
+        history_start = max(0, t_target - _history_len)
+        history_frames = list(range(history_start, t_target))
+        history_len = len(history_frames)
+        pad_len = _history_len - history_len
+
+        for g in range(_G):
+            for k in range(_N):
+                idx = (b * _G + g) * _N + k
+                last_obs_box = None
+                has_obs = False
+
+                for p in range(_history_len):
+                    if p < pad_len:
+                        continue
+                    t = history_frames[p - pad_len]
+                    ann_idx = int(annotations[b][t]["trajectory_ann_idxs"][g, 0, k].item())
+                    is_masked = bool(annotations[b][t]["trajectory_id_masks"][g, 0, k].item())
+                    if ann_idx == -1:
+                        continue
+                    pad_mask[idx, p] = False
+                    if is_masked:
+                        miss_mask[idx, p] = True
+                        continue
+
+                    frame_reid = frame_reid_by_idx[b * _T + t]
+                    if frame_reid is not None and ann_idx < frame_reid.shape[0]:
+                        reid_seq[idx, p] = frame_reid[ann_idx]
+                    gt_box = annotations[b][t]["bbox"][ann_idx].to(_device)
+                    if last_obs_box is not None:
+                        delta_seq[idx, p] = gt_box - last_obs_box
+                    last_obs_box = gt_box
+                    has_obs = True
+
+                ann_idx_t = int(annotations[b][t_target]["trajectory_ann_idxs"][g, 0, k].item())
+                is_masked_t = bool(annotations[b][t_target]["trajectory_id_masks"][g, 0, k].item())
+                frame_reid_t = frame_reid_by_idx[b * _T + t_target]
+                has_reid_t = frame_reid_t is not None and ann_idx_t != -1 and ann_idx_t < frame_reid_t.shape[0]
+                if ann_idx_t != -1 and not is_masked_t and has_obs and has_reid_t:
+                    tgt_reid[idx] = frame_reid_t[ann_idx_t].detach()
+                    tgt_box = annotations[b][t_target]["bbox"][ann_idx_t].to(_device)
+                    tgt_delta[idx] = tgt_box - last_obs_box
+                    valid_tgt[idx] = True
+
     return {
-        "trajectory_id_labels": trajectory_id_labels,
-        "trajectory_times": trajectory_times,
-        "trajectory_masks": trajectory_masks,
-        "trajectory_boxes": trajectory_boxes,
-        "trajectory_features": trajectory_features,
-        "unknown_id_labels": unknown_id_labels,
-        "unknown_times": unknown_times,
-        "unknown_masks": unknown_masks,
-        "unknown_boxes": unknown_boxes,
-        "unknown_features": unknown_features,
+        "reid_seq": reid_seq,
+        "delta_seq": delta_seq,
+        "pad_mask": pad_mask,
+        "miss_mask": miss_mask,
+        "tgt_reid": tgt_reid,
+        "tgt_delta": tgt_delta,
+        "valid_tgt": valid_tgt,
     }
 
 

@@ -6,6 +6,7 @@ from typing import Dict, Tuple, Any
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from structures.args import Args
 from models.deformable_detr.deformable_detr import build as build_deformable_detr
@@ -32,17 +33,9 @@ class HiMOT(nn.Module):
         match kwargs["part"]:
             case "detr":
                 frames = kwargs["frames"]
-                detr_outputs = self.detr(samples=frames)
-                targets = kwargs["detr_targets"]
-                batch_len = kwargs.get("detr_batch_len", kwargs.get("batch_len", None))
-                if batch_len is None:
-                    batch_len = len(targets)
-                detr_loss_dict, detr_indices = self.detr_criterion(
-                    outputs=detr_outputs,
-                    targets=targets,
-                    batch_len=batch_len,
-                )
-                return detr_outputs, detr_loss_dict, detr_indices
+                if "use_checkpoint" in kwargs:
+                    return checkpoint(self.detr, frames, use_reentrant=False)
+                return self.detr(samples=frames)
             case "traj_decoder":
                 seq_info = kwargs["seq_info"]
                 tokens, valid_mask = self.token_encoder(
