@@ -194,20 +194,18 @@ class TrajectoryDecoder(nn.Module):
             use_layer_norm: bool = True,
             rope_base: int = 10000,
             max_seq_len: int = 64,
-            reid_dim: Optional[int] = None,
-            motion_dim: int = 4,
-            l2norm_reid: bool = True,
+            emb_dim: Optional[int] = None,
+            box_dim: int = 4,
     ):
         super().__init__()
         if dim_feedforward is None:
             dim_feedforward = 4 * d_model
-        if reid_dim is None:
-            reid_dim = d_model
+        if emb_dim is None:
+            emb_dim = d_model
 
         self.d_model = d_model
-        self.reid_dim = reid_dim
-        self.motion_dim = motion_dim
-        self.l2norm_reid = l2norm_reid
+        self.emb_dim = emb_dim
+        self.box_dim = box_dim
 
         self.spec_token = nn.Parameter(torch.zeros(d_model))
 
@@ -225,8 +223,8 @@ class TrajectoryDecoder(nn.Module):
             for _ in range(num_layers)
         ])
 
-        self.reid_head = nn.Linear(d_model, reid_dim)
-        self.motion_head = nn.Linear(d_model, motion_dim)
+        self.emb_head = nn.Linear(d_model, emb_dim)
+        self.box_head = nn.Linear(d_model, box_dim)
 
     def _build_position_ids(
             self,
@@ -309,18 +307,17 @@ class TrajectoryDecoder(nn.Module):
                 })
 
         h_s = x[:, -1, :]
-        pred_reid = self.reid_head(h_s)
-        if self.l2norm_reid:
-            pred_reid = F.normalize(pred_reid, p=2, dim=-1)
-        pred_delta_box = self.motion_head(h_s)
+        pred_emb = self.emb_head(h_s)
+        pred_box = self.box_head(h_s)
+        pred_box = torch.sigmoid(pred_box).clamp(0.0, 1.0)
 
         if return_cache:
             new_cache = {
                 "layers": new_cache_layers,
                 "valid_count": valid_count.detach(),
             }
-            return pred_reid, pred_delta_box, new_cache
-        return pred_reid, pred_delta_box
+            return pred_emb, pred_box, new_cache
+        return pred_emb, pred_box
 
 
 def build_trajectory_decoder(
@@ -331,13 +328,12 @@ def build_trajectory_decoder(
         dropout: float = 0.0,
         rope_base: int = 10000,
         max_seq_len: int = 64,
-        reid_dim: Optional[int] = None,
-        l2norm_reid: bool = True,
+        emb_dim: Optional[int] = None,
 ):
     if dim_feedforward is None:
         dim_feedforward = 4 * d_model
-    if reid_dim is None:
-        reid_dim = d_model
+    if emb_dim is None:
+        emb_dim = d_model
     return TrajectoryDecoder(
         d_model=d_model,
         nhead=nhead,
@@ -347,6 +343,5 @@ def build_trajectory_decoder(
         attn_dropout=dropout,
         rope_base=rope_base,
         max_seq_len=max_seq_len,
-        reid_dim=reid_dim,
-        l2norm_reid=l2norm_reid,
+        emb_dim=emb_dim,
     )

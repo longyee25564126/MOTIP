@@ -39,8 +39,6 @@ def build(config: dict):
     detr_args.set_cost_class = config["DETR_SET_COST_CLASS"]
     detr_args.set_cost_bbox = config["DETR_SET_COST_BBOX"]
     detr_args.set_cost_giou = config["DETR_SET_COST_GIOU"]
-    detr_args.reid_backprop_mode = config.get("REID_BACKPROP_MODE", "head_only")
-
     detr_framework = config["DETR_FRAMEWORK"].lower()
     match detr_framework:
         case "deformable_detr":

@@ -14,7 +14,7 @@ from torchvision.transforms import v2
 from typing import Any, Generator, List
 
 from models.himot import build_himot
-from models.himot import build_reid_criterion, build_td_criterion
+from models.himot import build_td_criterion
 from runtime_option import runtime_option
 from utils.misc import yaml_to_dict, set_seed
 from configs.util import load_super_config, update_config
@@ -106,7 +106,6 @@ def train_engine(config: dict):
         log=f"Load the pre-trained DETR from '{config['DETR_PRETRAIN']}'. "
     )
     # Build Loss Function:
-    reid_criterion = build_reid_criterion(config=config)
     td_criterion = build_td_criterion(config=config)
 
     # Build Optimizer:
@@ -171,7 +170,6 @@ def train_engine(config: dict):
             dataloader=train_dataloader,
             model=model,
             detr_criterion=detr_criterion,
-            reid_criterion=reid_criterion,
             td_criterion=td_criterion,
             optimizer=optimizer,
             only_detr=only_detr,
@@ -232,13 +230,13 @@ def train_engine(config: dict):
                     outputs_dir=os.path.join(outputs_dir, "train", "eval_during_train", f"epoch_{epoch}"),
                     image_max_longer=config["INFERENCE_MAX_LONGER"],
                     size_divisibility=config.get("SIZE_DIVISIBILITY", 0),
-                    miss_tolerance=config["MISS_TOLERANCE"],
+                    miss_tolerance=config.get("MISS_TOLERANCE", 30),
                     use_sigmoid=config["USE_FOCAL_LOSS"] if "USE_FOCAL_LOSS" in config else False,
                     assignment_protocol=config["ASSIGNMENT_PROTOCOL"] if "ASSIGNMENT_PROTOCOL" in config else "hungarian",
-                    det_thresh=config["DET_THRESH"],
-                    newborn_thresh=config["NEWBORN_THRESH"],
-                    id_thresh=config["ID_THRESH"],
-                    area_thresh=config["AREA_THRESH"],
+                    det_thresh=config.get("DET_THRESH", 0.5),
+                    newborn_thresh=config.get("NEWBORN_THRESH", 0.5),
+                    id_thresh=config.get("ID_THRESH", 0.3),
+                    area_thresh=config.get("AREA_THRESH", 0),
                     inference_only_detr=config["INFERENCE_ONLY_DETR"] if config["INFERENCE_ONLY_DETR"] is not None
                     else config["ONLY_DETR"],
                 )
@@ -269,7 +267,6 @@ def train_one_epoch(
         dataloader: DataLoader,
         model,
         detr_criterion,
-        reid_criterion,
         td_criterion,
         optimizer,
         only_detr,
@@ -413,13 +410,6 @@ def train_one_epoch(
 
         # DETR criterion:
         detr_loss_dict, detr_indices = detr_criterion(outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len)
-        # ReID criterion:
-        reid_loss_dict = reid_criterion(
-            detr_outputs=detr_outputs,
-            annotations=annotations,
-            detr_indices=detr_indices,
-        )
-
         # Whether to only train the DETR, OR to train the TD together:
         if not only_detr:
             seq_info = prepare_for_himot(
@@ -430,16 +420,16 @@ def train_one_epoch(
             )
             td_out = model(seq_info=seq_info, part="traj_decoder")
             td_loss_dict = td_criterion(
-                pred_reid=td_out["pred_reid"],
-                pred_delta=td_out["pred_delta"],
-                tgt_reid=seq_info["tgt_reid"],
-                tgt_delta=seq_info["tgt_delta"],
+                pred_emb=td_out["pred_emb"],
+                pred_box=td_out["pred_box"],
+                tgt_emb=seq_info["tgt_emb"],
+                tgt_box=seq_info["tgt_box"],
                 valid_targets_mask=seq_info["valid_tgt"],
             )
         else:
             zero = detr_outputs["pred_logits"].new_tensor(0.0)
             td_loss_dict = {
-                "loss_td_reid": zero,
+                "loss_td_emb": zero,
                 "loss_td_box": zero,
                 "loss_td_total": zero,
             }
@@ -450,14 +440,21 @@ def train_one_epoch(
             detr_loss = sum(
                 detr_loss_dict[k] * detr_weight_dict[k] for k in detr_loss_dict.keys() if k in detr_weight_dict
             )
-            loss = detr_loss + reid_loss_dict["loss_reid"] + td_loss_dict["loss_td_total"]
+            loss = detr_loss + td_loss_dict["loss_td_total"]
             # Logging losses:
             metrics.update(name="loss", value=loss.item())
             metrics.update(name="detr_loss", value=detr_loss.item())
-            metrics.update(name="loss_reid", value=reid_loss_dict["loss_reid"].item())
             metrics.update(name="loss_td_total", value=td_loss_dict["loss_td_total"].item())
-            metrics.update(name="loss_td_reid", value=td_loss_dict["loss_td_reid"].item())
+            metrics.update(name="loss_td_emb", value=td_loss_dict["loss_td_emb"].item())
+            if "loss_td_emb_cos" in td_loss_dict:
+                metrics.update(name="loss_td_emb_cos", value=td_loss_dict["loss_td_emb_cos"].item())
+            if "loss_td_emb_mse" in td_loss_dict:
+                metrics.update(name="loss_td_emb_mse", value=td_loss_dict["loss_td_emb_mse"].item())
             metrics.update(name="loss_td_box", value=td_loss_dict["loss_td_box"].item())
+            if "loss_td_box_l1" in td_loss_dict:
+                metrics.update(name="loss_td_box_l1", value=td_loss_dict["loss_td_box_l1"].item())
+            if "loss_td_box_giou" in td_loss_dict:
+                metrics.update(name="loss_td_box_giou", value=td_loss_dict["loss_td_box_giou"].item())
             for k, v in detr_loss_dict.items():
                 metrics.update(name=k, value=v.item())
             loss /= accumulate_steps
@@ -672,21 +669,21 @@ def tensor_dict_index_select(tensor_dict, index, dim=0):
 def prepare_for_himot(detr_outputs, annotations, detr_indices, config: dict):
     _B, _T = len(annotations), len(annotations[0])
     _G, _, _N = annotations[0][0]["trajectory_ann_idxs"].shape
-    _device = detr_outputs["reid_emb"].device
-    _reid_dim = detr_outputs["reid_emb"].shape[-1]
+    _device = detr_outputs["track_emb"].device
+    _emb_dim = detr_outputs["track_emb"].shape[-1]
     _history_len = config.get("TD_HISTORY_LEN", 30)
 
     n_all = _B * _G * _N
-    reid_seq = torch.zeros((n_all, _history_len, _reid_dim), dtype=torch.float32, device=_device)
-    delta_seq = torch.zeros((n_all, _history_len, 4), dtype=torch.float32, device=_device)
+    track_seq = torch.zeros((n_all, _history_len, _emb_dim), dtype=torch.float32, device=_device)
+    bbox_seq = torch.zeros((n_all, _history_len, 4), dtype=torch.float32, device=_device)
     pad_mask = torch.ones((n_all, _history_len), dtype=torch.bool, device=_device)
     miss_mask = torch.zeros((n_all, _history_len), dtype=torch.bool, device=_device)
-    tgt_reid = torch.zeros((n_all, _reid_dim), dtype=torch.float32, device=_device)
-    tgt_delta = torch.zeros((n_all, 4), dtype=torch.float32, device=_device)
+    tgt_emb = torch.zeros((n_all, _emb_dim), dtype=torch.float32, device=_device)
+    tgt_box = torch.zeros((n_all, 4), dtype=torch.float32, device=_device)
     valid_tgt = torch.zeros((n_all,), dtype=torch.bool, device=_device)
 
-    # Pre-compute reid embeddings aligned to GT order for each frame.
-    frame_reid_by_idx = [None] * (_B * _T)
+    # Pre-compute embeddings aligned to GT order for each frame.
+    frame_emb_by_idx = [None] * (_B * _T)
     for b in range(_B):
         for t in range(_T):
             flatten_idx = b * _T + t
@@ -695,7 +692,7 @@ def prepare_for_himot(detr_outputs, annotations, detr_indices, config: dict):
                 continue
             go_back = torch.argsort(tgt_idx)
             matched_src = src_idx[go_back]
-            frame_reid_by_idx[flatten_idx] = detr_outputs["reid_emb"][flatten_idx][matched_src]
+            frame_emb_by_idx[flatten_idx] = detr_outputs["track_emb"][flatten_idx][matched_src]
 
     # Select target time per clip.
     t_targets = []
@@ -715,8 +712,6 @@ def prepare_for_himot(detr_outputs, annotations, detr_indices, config: dict):
         for g in range(_G):
             for k in range(_N):
                 idx = (b * _G + g) * _N + k
-                last_obs_box = None
-                has_obs = False
 
                 for p in range(_history_len):
                     if p < pad_len:
@@ -731,32 +726,27 @@ def prepare_for_himot(detr_outputs, annotations, detr_indices, config: dict):
                         miss_mask[idx, p] = True
                         continue
 
-                    frame_reid = frame_reid_by_idx[b * _T + t]
-                    if frame_reid is not None and ann_idx < frame_reid.shape[0]:
-                        reid_seq[idx, p] = frame_reid[ann_idx]
-                    gt_box = annotations[b][t]["bbox"][ann_idx].to(_device)
-                    if last_obs_box is not None:
-                        delta_seq[idx, p] = gt_box - last_obs_box
-                    last_obs_box = gt_box
-                    has_obs = True
+                    frame_emb = frame_emb_by_idx[b * _T + t]
+                    if frame_emb is not None and ann_idx < frame_emb.shape[0]:
+                        track_seq[idx, p] = frame_emb[ann_idx]
+                    bbox_seq[idx, p] = annotations[b][t]["bbox"][ann_idx].to(_device)
 
                 ann_idx_t = int(annotations[b][t_target]["trajectory_ann_idxs"][g, 0, k].item())
                 is_masked_t = bool(annotations[b][t_target]["trajectory_id_masks"][g, 0, k].item())
-                frame_reid_t = frame_reid_by_idx[b * _T + t_target]
-                has_reid_t = frame_reid_t is not None and ann_idx_t != -1 and ann_idx_t < frame_reid_t.shape[0]
-                if ann_idx_t != -1 and not is_masked_t and has_obs and has_reid_t:
-                    tgt_reid[idx] = frame_reid_t[ann_idx_t].detach()
-                    tgt_box = annotations[b][t_target]["bbox"][ann_idx_t].to(_device)
-                    tgt_delta[idx] = tgt_box - last_obs_box
+                frame_emb_t = frame_emb_by_idx[b * _T + t_target]
+                has_emb_t = frame_emb_t is not None and ann_idx_t != -1 and ann_idx_t < frame_emb_t.shape[0]
+                if ann_idx_t != -1 and not is_masked_t and has_emb_t:
+                    tgt_emb[idx] = frame_emb_t[ann_idx_t].detach()
+                    tgt_box[idx] = annotations[b][t_target]["bbox"][ann_idx_t].to(_device)
                     valid_tgt[idx] = True
 
     return {
-        "reid_seq": reid_seq,
-        "delta_seq": delta_seq,
+        "track_seq": track_seq,
+        "bbox_seq": bbox_seq,
         "pad_mask": pad_mask,
         "miss_mask": miss_mask,
-        "tgt_reid": tgt_reid,
-        "tgt_delta": tgt_delta,
+        "tgt_emb": tgt_emb,
+        "tgt_box": tgt_box,
         "valid_tgt": valid_tgt,
     }
 

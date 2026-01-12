@@ -17,7 +17,7 @@ from data.joint_dataset import dataset_classes
 from data.seq_dataset import SeqDataset
 from models.runtime_tracker import RuntimeTracker
 from log.log import Metrics
-from models.motip import build as build_motip
+from models.himot import build_himot
 from models.misc import load_checkpoint
 
 
@@ -66,7 +66,7 @@ def submit_and_evaluate(config: dict):
     else:
         logger.info(f"Outputs dir '{outputs_dir}' created.")
 
-    model, _ = build_motip(config=config)
+    model, _ = build_himot(config=config)
 
     use_previous_checkpoint = config.get("USE_PREVIOUS_CHECKPOINT", False)
     if not use_previous_checkpoint:
@@ -95,6 +95,10 @@ def submit_and_evaluate(config: dict):
         det_thresh=config["DET_THRESH"],
         newborn_thresh=config["NEWBORN_THRESH"],
         id_thresh=config["ID_THRESH"],
+        iou_thresh=config.get("IOU_THRESH", 0.1),
+        emb_cos_weight=config.get("EMB_COS_WEIGHT", 1.0),
+        emb_mse_weight=config.get("EMB_MSE_WEIGHT", 0.5),
+        iou_cost_weight=config.get("IOU_COST_WEIGHT", 1.0),
         area_thresh=config.get("AREA_THRESH", 0),
         inference_only_detr=config["INFERENCE_ONLY_DETR"] if config["INFERENCE_ONLY_DETR"] is not None
         else config["ONLY_DETR"],
@@ -133,6 +137,10 @@ def submit_and_evaluate_one_model(
         det_thresh: float = 0.5,
         newborn_thresh: float = 0.5,
         id_thresh: float = 0.1,
+        iou_thresh: float = 0.1,
+        emb_cos_weight: float = 1.0,
+        emb_mse_weight: float = 0.5,
+        iou_cost_weight: float = 1.0,
         area_thresh: int = 0,
         inference_only_detr: bool = False,
         dtype: str = "FP32",
@@ -203,6 +211,10 @@ def submit_and_evaluate_one_model(
             det_thresh=det_thresh,
             newborn_thresh=newborn_thresh,
             id_thresh=id_thresh,
+            iou_thresh=iou_thresh,
+            emb_cos_weight=emb_cos_weight,
+            emb_mse_weight=emb_mse_weight,
+            iou_weight=iou_cost_weight,
             area_thresh=area_thresh,
             only_detr=inference_only_detr,
             dtype=dtype,

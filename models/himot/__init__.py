@@ -1,15 +1,10 @@
 # Copyright (c) Ruopeng Gao. All Rights Reserved.
 
-from .reid_head import ReIDHead
-from .reid_criterion import ReIDCriterion, build_reid_criterion
 from .traj_token_encoder import TrajectoryTokenEncoder, build_trajectory_token_encoder
 from .traj_decoder import TrajectoryDecoder, build_trajectory_decoder
 from .td_criterion import TDCriterion, build_td_criterion
 
 __all__ = [
-    "ReIDHead",
-    "ReIDCriterion",
-    "build_reid_criterion",
     "TrajectoryTokenEncoder",
     "build_trajectory_token_encoder",
     "TrajectoryDecoder",

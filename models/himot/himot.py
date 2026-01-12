@@ -39,36 +39,36 @@ class HiMOT(nn.Module):
             case "traj_decoder":
                 seq_info = kwargs["seq_info"]
                 tokens, valid_mask = self.token_encoder(
-                    reid_emb=seq_info["reid_seq"],
-                    delta_box=seq_info["delta_seq"],
+                    track_emb=seq_info["track_seq"],
+                    bbox_cxcywh=seq_info["bbox_seq"],
                     pad_mask=seq_info["pad_mask"],
                     miss_mask=seq_info["miss_mask"],
                 )
                 cache = kwargs.get("cache", None)
                 return_cache = kwargs.get("return_cache", False)
                 if return_cache:
-                    pred_reid, pred_delta, new_cache = self.traj_decoder(
+                    pred_emb, pred_box, new_cache = self.traj_decoder(
                         tokens=tokens,
                         valid_mask=valid_mask,
                         cache=cache,
                         return_cache=True,
                     )
                     return {
-                        "pred_reid": pred_reid,
-                        "pred_delta": pred_delta,
+                        "pred_emb": pred_emb,
+                        "pred_box": pred_box,
                         "valid_mask": valid_mask,
                         "cache": new_cache,
                     }
                 else:
-                    pred_reid, pred_delta = self.traj_decoder(
+                    pred_emb, pred_box = self.traj_decoder(
                         tokens=tokens,
                         valid_mask=valid_mask,
                         cache=cache,
                         return_cache=False,
                     )
                     return {
-                        "pred_reid": pred_reid,
-                        "pred_delta": pred_delta,
+                        "pred_emb": pred_emb,
+                        "pred_box": pred_box,
                         "valid_mask": valid_mask,
                     }
             case _:
@@ -104,28 +104,26 @@ def build(config: dict) -> Tuple[HiMOT, nn.Module]:
     detr_args.set_cost_class = config["DETR_SET_COST_CLASS"]
     detr_args.set_cost_bbox = config["DETR_SET_COST_BBOX"]
     detr_args.set_cost_giou = config["DETR_SET_COST_GIOU"]
-    detr_args.reid_backprop_mode = config.get("REID_BACKPROP_MODE", "head_only")
-
     detr, detr_criterion, _ = build_deformable_detr(args=detr_args)
 
+    track_dim = config["DETR_HIDDEN_DIM"]
     token_encoder = build_trajectory_token_encoder(
-        reid_dim=config.get("REID_DIM", config["DETR_HIDDEN_DIM"]),
-        d_model=config.get("TD_DMODEL", config.get("TD_D_MODEL", config["DETR_HIDDEN_DIM"])),
+        track_dim=track_dim,
+        d_model=config.get("TD_DMODEL", config.get("TD_D_MODEL", track_dim)),
         hidden_dim=config.get("TD_ENCODER_HIDDEN_DIM", None),
         dropout=config.get("TD_ENCODER_DROPOUT", 0.0),
         use_layer_norm=config.get("TD_ENCODER_USE_LN", True),
         num_layers=config.get("TD_ENCODER_NUM_LAYERS", 2),
     )
     traj_decoder = build_trajectory_decoder(
-        d_model=config.get("TD_DMODEL", config.get("TD_D_MODEL", config["DETR_HIDDEN_DIM"])),
+        d_model=config.get("TD_DMODEL", config.get("TD_D_MODEL", track_dim)),
         nhead=config.get("TD_NHEAD", config["DETR_NUM_HEADS"]),
         num_layers=config.get("TD_NUM_LAYERS", 6),
         dim_feedforward=config.get("TD_DIM_FEEDFORWARD", None),
         dropout=config.get("TD_DROPOUT", 0.0),
         rope_base=config.get("TD_ROPE_BASE", 10000),
         max_seq_len=config.get("TD_MAX_SEQ_LEN", 64),
-        reid_dim=config.get("REID_DIM", config["DETR_HIDDEN_DIM"]),
-        l2norm_reid=config.get("TD_L2NORM_REID", True),
+        emb_dim=track_dim,
     )
 
     model = HiMOT(
