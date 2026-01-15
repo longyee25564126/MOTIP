@@ -365,6 +365,9 @@ class ArimaTrajectoryDecoder(nn.Module):
         n, l, d = tokens.shape
         device = tokens.device
         pred_emb = torch.zeros((n, d), device=device, dtype=tokens.dtype)
+        assert tokens.shape[:2] == valid_mask.shape, "tokens and valid_mask shape mismatch"
+        if miss_mask is not None:
+            assert miss_mask.shape == valid_mask.shape, "miss_mask shape mismatch"
         for i in range(n):
             mask_valid = valid_mask[i]
             mask_obs = mask_valid & (~miss_mask[i])

@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 from utils.misc import distributed_device
-from utils.box_ops import box_cxcywh_to_xywh, box_cxcywh_to_xyxy, box_iou_union
+from utils.box_ops import box_cxcywh_to_xywh
 
 
 @dataclass
@@ -84,10 +84,8 @@ class RuntimeTracker:
         self.det_thresh = det_thresh
         self.newborn_thresh = newborn_thresh
         self.id_thresh = id_thresh
-        self.iou_thresh = iou_thresh
         self.emb_cos_weight = emb_cos_weight
         self.emb_mse_weight = emb_mse_weight
-        self.iou_weight = iou_weight
         self.area_thresh = area_thresh
         self.only_detr = only_detr
         self.history_len = 30
@@ -190,23 +188,9 @@ class RuntimeTracker:
         diff = pred_norm[:, None, :] - det_norm[None, :, :]
         emb_cost_mse = (diff * diff).mean(dim=-1)
 
-        use_iou = (self.iou_weight is not None and self.iou_weight > 0) or (self.iou_thresh is not None)
-        if use_iou:
-            pred_xyxy = box_cxcywh_to_xyxy(pred_box)
-            det_xyxy = box_cxcywh_to_xyxy(boxes)
-            iou, _ = box_iou_union(pred_xyxy, det_xyxy)
-            iou_cost = 1.0 - iou
-        else:
-            iou = None
-            iou_cost = 0.0
-
         cost = self.emb_cos_weight * emb_cost_cos + self.emb_mse_weight * emb_cost_mse
-        if use_iou:
-            cost = cost + self.iou_weight * iou_cost
         if self.id_thresh is not None:
             cost = torch.where(emb_cost_cos > self.id_thresh, cost.new_tensor(1e6), cost)
-        if use_iou and self.iou_thresh is not None:
-            cost = torch.where(iou < self.iou_thresh, cost.new_tensor(1e6), cost)
 
         cost_cpu = cost.detach().cpu().numpy()
         row_ind, col_ind = linear_sum_assignment(cost_cpu)
