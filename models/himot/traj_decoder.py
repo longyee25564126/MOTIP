@@ -8,6 +8,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from utils.box_ops import box_cxcywh_to_xyxy, box_iou_union
 
 
 class CausalSelfAttention(nn.Module):
@@ -248,6 +249,7 @@ class TrajectoryDecoder(nn.Module):
             self,
             tokens: torch.Tensor,
             valid_mask: torch.Tensor,
+            miss_mask: Optional[torch.Tensor] = None,
             cache: Optional[dict] = None,
             return_cache: bool = False,
     ):
@@ -258,6 +260,7 @@ class TrajectoryDecoder(nn.Module):
             [valid_mask, torch.ones((n, 1), dtype=torch.bool, device=valid_mask.device)],
             dim=1,
         )
+        # miss_mask is not used in transformer decoder; kept for interface compatibility
 
         past_valid_count = None
         if cache is not None and cache.get("valid_count") is not None:
@@ -320,6 +323,65 @@ class TrajectoryDecoder(nn.Module):
         return pred_emb, pred_box
 
 
+class ArimaTrajectoryDecoder(nn.Module):
+    def __init__(
+            self,
+            emb_dim: int,
+            box_dim: int = 4,
+            min_valid_obs: int = 8,
+    ):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.box_dim = box_dim
+        self.min_valid_obs = min_valid_obs
+        self.box_head = nn.Linear(emb_dim, box_dim)
+
+    @staticmethod
+    def _forecast_arima011(obs: torch.Tensor, min_valid: int) -> torch.Tensor:
+        # obs: (T, D)
+        if obs.shape[0] < 2:
+            return obs[-1]
+        diff = obs[1:] - obs[:-1]  # (T-1, D)
+        if diff.shape[0] < 1:
+            return obs[-1]
+        eps_curr = diff[1:]
+        eps_prev = diff[:-1]
+        denom = (eps_prev ** 2).sum() + 1e-6
+        theta = (eps_curr * eps_prev).sum() / denom
+        diff_hat = theta * eps_prev[-1]
+        return obs[-1] + diff_hat
+
+    def forward(
+            self,
+            tokens: torch.Tensor,
+            valid_mask: torch.Tensor,
+            miss_mask: Optional[torch.Tensor] = None,
+            cache: Optional[dict] = None,
+            return_cache: bool = False,
+    ):
+        # tokens: (N, L, D)
+        if miss_mask is None:
+            miss_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+        n, l, d = tokens.shape
+        device = tokens.device
+        pred_emb = torch.zeros((n, d), device=device, dtype=tokens.dtype)
+        for i in range(n):
+            mask_valid = valid_mask[i]
+            mask_obs = mask_valid & (~miss_mask[i])
+            obs = tokens[i, mask_obs]
+            if obs.shape[0] >= self.min_valid_obs:
+                pred_emb[i] = self._forecast_arima011(obs, self.min_valid_obs)
+            elif obs.shape[0] > 0:
+                # fallback to last valid obs
+                pred_emb[i] = obs[-1]
+            else:
+                pred_emb[i] = tokens[i, -1]
+        pred_box = torch.sigmoid(self.box_head(pred_emb))
+        if return_cache:
+            return pred_emb, pred_box, {}
+        return pred_emb, pred_box
+
+
 def build_trajectory_decoder(
         d_model: int,
         nhead: int,
@@ -329,19 +391,29 @@ def build_trajectory_decoder(
         rope_base: int = 10000,
         max_seq_len: int = 64,
         emb_dim: Optional[int] = None,
+        decoder_type: str = "transformer",
+        min_valid_obs: int = 8,
 ):
     if dim_feedforward is None:
         dim_feedforward = 4 * d_model
     if emb_dim is None:
         emb_dim = d_model
-    return TrajectoryDecoder(
-        d_model=d_model,
-        nhead=nhead,
-        num_layers=num_layers,
-        dim_feedforward=dim_feedforward,
-        dropout=dropout,
-        attn_dropout=dropout,
-        rope_base=rope_base,
-        max_seq_len=max_seq_len,
-        emb_dim=emb_dim,
-    )
+    decoder_type = decoder_type.lower()
+    if decoder_type == "arima_011":
+        return ArimaTrajectoryDecoder(
+            emb_dim=emb_dim,
+            box_dim=4,
+            min_valid_obs=min_valid_obs,
+        )
+    else:
+        return TrajectoryDecoder(
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            attn_dropout=dropout,
+            rope_base=rope_base,
+            max_seq_len=max_seq_len,
+            emb_dim=emb_dim,
+        )

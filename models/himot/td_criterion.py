@@ -55,9 +55,11 @@ class TDCriterion(nn.Module):
 
         if self.emb_loss_type != "cosine":
             raise ValueError(f"Unsupported emb_loss_type: {self.emb_loss_type}")
+        norm_pred = F.normalize(pred_emb, p=2, dim=-1)
+        norm_tgt = F.normalize(tgt_emb, p=2, dim=-1)
         cosine_sim = F.cosine_similarity(pred_emb, tgt_emb, dim=-1)
         loss_cos = 1.0 - cosine_sim
-        loss_mse = F.mse_loss(pred_emb, tgt_emb, reduction="none").mean(dim=-1)
+        loss_mse = F.mse_loss(norm_pred, norm_tgt, reduction="none").mean(dim=-1)
         if self.reduction == "mean":
             loss_cos = loss_cos.mean()
             loss_mse = loss_mse.mean()

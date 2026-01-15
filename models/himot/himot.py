@@ -50,6 +50,7 @@ class HiMOT(nn.Module):
                     pred_emb, pred_box, new_cache = self.traj_decoder(
                         tokens=tokens,
                         valid_mask=valid_mask,
+                        miss_mask=seq_info["miss_mask"],
                         cache=cache,
                         return_cache=True,
                     )
@@ -63,6 +64,7 @@ class HiMOT(nn.Module):
                     pred_emb, pred_box = self.traj_decoder(
                         tokens=tokens,
                         valid_mask=valid_mask,
+                        miss_mask=seq_info["miss_mask"],
                         cache=cache,
                         return_cache=False,
                     )
@@ -124,6 +126,8 @@ def build(config: dict) -> Tuple[HiMOT, nn.Module]:
         rope_base=config.get("TD_ROPE_BASE", 10000),
         max_seq_len=config.get("TD_MAX_SEQ_LEN", 64),
         emb_dim=track_dim,
+        decoder_type=config.get("TRAJ_DECODER_TYPE", "transformer"),
+        min_valid_obs=config.get("TD_MIN_VALID_OBS", 8),
     )
 
     model = HiMOT(
